@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+shopt -s extglob
+set -x
+# Capture args and assign them to "claasifying" arrays 
+# file = "files array" dir = "directories array" args = "Arguments array"
+full_args=( "$@" )
+args=() ; paths=() ; X=0
+while [[ $# -gt 0 ]] ; do
+	key="$1"
+	case $key in
+	     --*|-*)
+    		args[X]="$1"
+	    	shift # past argument
+	    ;;
+	    *)
+		if [[ -f "$1" || -d "$1" ]] ; then
+			paths[X]="$1" # save it in an array for later
+			(( X++ ))
+		fi
+		shift # past argument
+	    ;;
+	esac
+done
+list_menu() {
+cat <<EOF
+Thunarbox Usage
+thunarbox.sh <action call> <arguments>
+[ACTIONS] 	                [ARG TYPE]
+--encrypt            | -enc 	<filepath>	Opens Encrypt File (OpenSSl) dialog with OpenSSL. 
+						This utilizes AES-256-CBC encryption
+		 				This is not for communications purposes.  
+--decrypt            | -dec	<file>	Decrypts file (OpenSSL)
+--shred              | -sf      <file>      Opens shred file dialog and shows progress output
+--rsync-to           | -rf 	<directory> 	Opens directory selection for rsync destination
+						This defaults to --del so choose your destination 
+						carefully
+--rsync-from         | -rt      <directory>     Inverse of --rsync-to set the source path instead
+						also uses --del flag
+--rsync-to-as-root   | -rtr     <directory>     Same as --rsync-to except prompts to run as root 
+--rsync-from-as-root | -rfr     <directory>     Inverse of the above with root prompt
+#--no-del            | -nd      <with --rsync*> Disable --del flag {not impplemented yet               
+--remux-mkv          | -r2mkv   <video file/s>	Remux video (and audio) into mkv container(FFmpeg)
+						works with multiselecting file "%F" in thunar
+--ffmpeg-meta        |-ffv      <video file>    View metadata from video files
+--dd-image           |-dd       <disk image>    Write Disk Image (iso, img, bin) to USB or other
+						external storage device.(Not for .bin & .cue files)
+--shred              | -sf      		               
+--list-all 	     | -L			List this menu.
+--help               | -h                       Same as list
+EOF
+}
+#======================Zenity Dialog functions========================
+passwd_dialog() {
+	if [[ "$1" == create ]] ; then
+		zenity --width=$W --height=$H --forms --title="$title" \
+			--text="$text1" \
+			--add-password="Enter Passphrase:" \
+ 			--add-password="Confirm Passphrase" --ok-label="$text2" \ | tr -s \| ' ' 
+	elif [[ "$1" == enter ]] ; then
+		zenity 	--forms --title="$title" --text="$text1"\
+		      	--ok-label="$text2" --add-password="Enter Passphrase:" 
+	fi
+}
+passwd_match() {
+	passwd=( $(passwd_dialog create) )
+	while [[ -n "${passwd[1]}" ]] ; do
+		if [[ "${passwd[0]}" == "${passwd[1]}" ]] ; then
+			unset passwd[1]
+			echo "${passwd[0]}" 
+			break
+		elif [[ "${passwd[0]}" != "${passwd[1]}" ]] ; then
+			title="ERROR!" ;  text1="Passphrase does not match!" 	
+			passwd=( $(passwd_dialog) ) 
+		fi	
+	done
+}
+passwd_entry() {
+	title="$title" ; text1="Enter password:" ; text2="OK"
+	passwd="$(passwd_dialog enter)"
+	if [[ -n "$passwd" ]] ; then 
+		echo "$passwd"
+		unset passwd    
+	fi	
+}
+text_box() {
+	# Variables $H, $W $title, $text1, $text2, $text3 & $label must be defined 
+	# by the function which calls this function in order for these to inherit
+        # thier strings	
+	zenity  --width=$W --height=$H --title="$title"  --entry \
+		--text="$text1" \
+		--entry-text="$text2"\
+	       	--ok-label="$label" 
+}
+dir_select_dialog() {
+	# Handeling additional directories other than those passed through thunar
+	zenity  --file-selection --title="$title" --directory "$1" 
+}
+file_select_dialog() {
+	# Handeling additional files other than those passed through thunar
+	zenity  --file-selection --title="$title" --file "$1" 
+}
+scroll_text_output() {
+	# Use with "|" OR "2> >(substitution)" for reading from strout OR  stderr respectively  
+	zenity --width=$W --height=$H --title="$title" --text-info --auto-scroll
+}
+text_output() {
+	zenity --width=$W --height=$H --title="$title" --text-info
+}
+##################################################################################
+#================Geeral Functions(using other applications)====================#
+##################################################################################
+
+#=======================Removable Storage Device Detection=======================#
+#Detects plugable devices and prints only ones with Model and device path like so
+# 	Model_One /dev/sdx
+# 	Model_Two /dev/sdy
+# 	Model_three /dev/sdz
+device_detect() {
+	OLD_IFS=$IFS ; IFS=$'\n'
+	devices=( $(lsblk -o RM,MODEL,PATH) )
+	unset devices[0]
+	#echo ${devices[@]}
+	create_dev_list() {
+		X=0
+		for dev in ${devices[@]} ; do
+			IFS=$' \t'
+			tmp_array=( $dev )
+			L=${#tmp_array[@]}
+		#	echo ${tmp_array[@]} 
+		#	echo $L
+			if [[ $L == 3 ]] ; then
+				echo ${tmp_array[@]}
+				#echo ${#tmp_array[@]}
+			fi
+			unset tmp_array
+			(( X++ ))
+		done
+		IFS=$OLD_IFS 
+	}
+	#IFS=$'\n'
+	dev_path=( $(create_dev_list | cut -d ' ' -f 3) )
+	model=( $(create_dev_list | cut -d ' ' -f 2) )
+	plug=( $(create_dev_list | cut -d ' ' -f 1) )
+	X=0 
+	for value in ${plug[@]} ; do
+		if [[ $value == '1' ]] ; then
+			echo -e "${dev_path[X]}\t${model[X]}" 
+		fi
+		(( X++ ))
+	done
+	IFS=$OLD_IFS 
+}
+
+##################################################################################
+########################### Thunarbox Function Calls #############################
+##################################################################################
+# These functions are aimed at adding a variety of context menu tasks for        #
+# Thunar each function call is sort of it's own an independent subscript the     #
+# use of not everyone will use these actions depends on the users needs or       #
+# preferences some have GUI windows some do not, depends on the task. --list-all #
+# will display the function call flags available to thunarbox.sh 		 #
+##################################################################################
+
+#======================Encrypt File Function======================================
+encrypt_file() {
+	W=400 ; H=150
+	title="OpenSSL" 
+	text1="Create an encryption passphrase"
+	text2="Encrypt"
+	passphrase="$(passwd_match)"
+	if [[ -z "$passphrase" ]]; then
+		exit 
+	elif [[ -n "$passphrase" && -f "${paths[0]}" ]]; then
+		openssl enc -aes-256-cbc -salt -in "${paths[0]}" -out "${paths[0]}.enc" -k "$passphrase"
+	fi
+}
+
+#======================Decrypt File Function========================
+decrypt_file() {
+	title="Decrypt File" 
+	text1="Enter Passphrase"
+	text2="Decrypt"
+	passphrase="$(passwd_entry)"
+	if [[ -z "$passphrase" ]]; then
+		exit 
+	elif [[ -n "$passphrase" && -f "${paths[0]}" ]]; then
+		openssl enc -aes-256-cbc -d -in "${paths[0]}" -out "${paths[0]%.*}" -k "$passphrase"
+	fi
+}
+
+#======================Rsync Function========================
+rsync_dir() {
+	dir_test() {
+		for D in "${paths[@]}" ; do if [[ -d "$D" ]] ;  then directory="$D" ; break ; fi ; done
+	}
+	# Not this toggles additional parameters executed in script and not by the user
+	# these flags are set during the case matching performed to determine which 
+	# rsync arguments to use. They are not parsed from the commandline. 
+	rsync_opts="-aAXhv --del" ; X=0
+        for flag in "${args[@]}" ; do
+		if [[ -d "${paths[0]}" ]]; then		
+			case $flag in
+				to)
+					title="Choose a Destinsation Directory"
+					src_dir="${paths[0]}"  ;  dest_dir="$(dir_select_dialog)" 
+					rsync_opts="-aAXhv --del" 
+					;;
+				from)
+					title="Choose a Source Directory"
+					src_dir="$(dir_select_dialog)"  ;  dest_dir="${paths[0]}" 
+					rsync_opts="-aAXhv --del" 
+					;;
+				as_root)
+					rsync_opts="-aAXhv --del" 
+					root="yes"
+					;;
+				no_del) 
+					rsync_opts="-aAXhv" 
+					;;
+			esac
+		fi
+	done
+	if [[ "$root" == "yes" ]] ; then
+		pkexec --disable-internal-agent rsync "$rsync_opts" "$src_dir" "$dest_dir" | scroll_text_output
+	else
+		rsync "$rsync_opts" "$src_dir" "$dest_dir" | scroll_text_output 
+	fi
+}
+
+#======================Shred File Function========================
+shred_file() {
+	W=600 ; H=300
+	title="Shred File" ; text1="Are you sure you want to shred?"
+	text2="${paths[0]}" ; label="Shred"
+	file_choice="$(text_box)" ; title="Shred Progress"
+	shred -fv -n 2 "$file_choice" 2> >(scroll_text_output) &&
+	rm -rf "$file_choice"
+}
+
+dd_image() {
+	W=600 ; H=400 ;	title="DD Image" ; text1="Device Path/Name"
+	choice=( $(device_detect |  zenity --title="$title" --list --column="$text1") )	
+	device="${choice[0]}"
+	dev_name="${choice[1]}"
+	fileext=( "${paths[0]##*.}" )
+	sudo_password="$(passwd_entry)"
+	#echo "$dd_args_confirm"
+	in_file="if=${paths[0]}"
+	of_dev="of=$choice"
+	dd_args=( "bs=4M" "status=progress" "oflag=sync" )
+	dd_args_confirm=( $(zenity --title=$title --width=600 --entry --text="Confirm DD Arguments"\
+	       			   --entry-text=""$in_file" "$of_dev" "${dd_args[@]}"") )
+	echo "${dd_args_confirm[@]}"
+	in_file="${dd_args_confirm[0]}"
+	of_dev="${dd_args_confirm[1]}"
+	unset dd_args_confirm[0]
+	unset dd_args_confirm[1]
+	dd_args=( ${dd_args_confirm[@]} )
+	#echo "in=file = $in_file"  
+	#echo "of=dev = $of_dev"
+	#echo "dd args = $dd_args"
+      	#confirm_string="${dd_args_confirm[0]} ${dd_args_confirm[1]} $dd_args_confirm[2]"
+	#echo "args length = ${#dd_args_confirm[@]}"
+	if [[ -f "${paths[0]}" && $fileext == @(dmg|iso|img|bin) ]]; then
+		#echo ""$(passwd_entry)" | dd "$dd_args_confirm""
+		echo "$sudo_password" | sudo -S dd ""$in_file $of_dev ${dd_args[@]}"" 2> >(scroll_text_output)
+	fi
+}
+# Remux supported video files an repack them into mkv's
+remux_to_mkv() {
+
+	fnum=${#paths[@]} ; X=0
+	echo $fnum	
+	while [[ fnum -gt 0 ]] ; do
+		ffmpeg -v quiet -i "${paths[X]}" -codec copy "${paths[X]%.*}.mkv" 
+	       	(( fnum-- )) 
+		(( X++ ))
+	done
+	unset X
+}
+
+# redirects output of ffmpeg's metadata to zenity 
+ffmpeg_view_meta() {
+	W=800 ; H=400 ; title="Video Metadata"
+	# fileext=${file[0]##*.}	
+	ffmpeg -i "${paths[0]}" -hide_banner 2> >(head -n -1 | text_output)
+}
+# redirects output of ffprobe's audio tag info 
+ffmpeg_view_tags() {	
+	W=600 ; H=400 ; title="Video Metadata"
+	# fileext=${file[0]##*.}	
+	ffprobe "${paths[0]}" -hide_banner  2> >(text_output)
+}
+#=========================Parse first argument====================
+#This matches $1 against a list of calls. The matching call triggers 
+#thunarbox.sh to execute a selected body of code as defined by each 
+#function, Subfunctions may be called to execute common tasks such as 
+#the zenity function to determine the behavior of zenity when a GUI is called for.
+
+#if [[ -f "${file[0]}" || -d "${dir[0]}" ]]; then
+#for ForD in "${paths[@]}"  ; do
+#while [[ ${#args[@]} -gt 1 ]] ; do
+case "${args[0]}" in 
+	--encrypt|-enc)
+		encrypt_file 
+		exit 0
+		;;
+	--decrypt|-dec)
+		decrypt_file 
+		exit 0
+		;;
+	--rsync-to|-rt)
+		rsync_dir to 		
+		exit 0
+		;;
+	--rsync-from|-rf)
+		rsync_dir from		
+		exit 0
+		;;
+	--rsync-to-as-root|-rtr)
+		rsync_dir to as_root 		
+		exit 0
+		;;
+	--rsync-from-as-root|-rfr)
+		rsync_dir from as_root
+		exit 0
+		;;
+	--rsync-to-nd|-rtn)
+		rsync_dir to no_del 		
+		exit 0
+		;;
+	--rsync-from-nd|-rfn)
+		rsync_dir from no_del		
+		exit 0
+		;;
+	--rsync-to-as-root-nd|-rtrn)
+		rsync_dir to as_root no_del		
+		exit 0
+		;;
+	--rsync-from-as-root-nd|-rfrn)
+		rsync_dir from as_root no_del
+		exit 0
+		;;
+	--shred|-sf)
+		shred_file
+		exit 0
+		;;
+	--dd-image|-dd)
+		dd_image 
+		exit 0
+		;;
+	--remux-mkv|-r2mkv)
+		remux_to_mkv  
+		exit 0
+		;;
+	--ffmpeg-meta|-ffv)
+		ffmpeg_view_meta  
+		exit 0
+		;;
+	--ffmpeg-tag|-tag)
+		ffmpeg_view_tags 
+		exit 0
+		;;
+	--list-all|-L)
+		list_menu 
+		exit 0
+		;;
+	--help|-h)
+		list_menu 
+		exit 0
+		;;
+	*) 	
+		echo "Thunarbox needs arguments" 
+		list_menu
+		exit 1
+		;;
+esac
+
+
